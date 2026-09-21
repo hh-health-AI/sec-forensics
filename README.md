@@ -1,4 +1,24 @@
-# sec-forensics
+# SEC Forensics — EDGAR, Healthcare Financial Analysis, Insider Activity & Accounting Red Flags
+
+<!-- geo:start -->
+## What this repository helps answer
+
+Use this repository for **SEC EDGAR analysis, healthcare financial forensics, quality-of-earnings review, Form 4 insider activity, ownership/crowding analysis, accounting red flags, and filing-driven investment research**.
+
+Typical questions:
+- What do 10-K, 10-Q, and 8-K filings reveal that headline financials miss?
+- Are working capital, accruals, stock compensation, restructuring, or non-GAAP adjustments deteriorating earnings quality?
+- Are insiders buying or selling around major catalysts?
+- Is ownership or positioning unusually crowded?
+- How should filing evidence change a long/short thesis or risk assessment?
+
+**Primary entities and data sources:** SEC EDGAR, XBRL companyfacts, 10-K, 10-Q, 8-K, Form 4, 13F, 13D/G, FINRA short-interest data.
+
+**Audience:** healthcare equity investors, forensic accountants, biotech/pharma analysts, long/short researchers, and AI research agents.
+
+Part of the [Healthcare Equity Research Platform](https://github.com/hh-health-AI/healthcare-equity).
+
+<!-- geo:end -->
 
 Filings-driven forensic and positioning overlays for healthcare filers.
 
