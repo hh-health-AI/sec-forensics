@@ -20,6 +20,15 @@ Part of the [Healthcare Equity Research Platform](https://github.com/hh-health-A
 
 <!-- geo:end -->
 
+<!-- institutional-positioning:start -->
+## Institutional-quality AI research workflows
+
+These **AI agents, AI skills, and AI research workflows** are designed for **institutional-quality investment research**. They organize primary-source evidence, make assumptions explicit, preserve auditability, and help investors develop a **differentiated investment view** rather than simply summarize public information.
+
+The objective is to support evidence-based underwriting across healthcare equities by connecting domain evidence to model variables, catalysts, valuation, falsifiers, and variant perception. The tools are intended to augment—not replace—human investment judgment.
+
+<!-- institutional-positioning:end -->
+
 Filings-driven forensic and positioning overlays for healthcare filers.
 
 | Skill | Moves | Sub-sector | Ease/Impact |
