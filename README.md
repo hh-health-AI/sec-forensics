@@ -83,3 +83,29 @@ Review them before use.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Ratio calculation and output compatibility
+
+The calculator emits schema version 2. DSO/DIO use period-end balances matched
+to annual or four-contiguous-quarter flows and their actual day counts. Partial
+quarters are never silently annualized. Missing or mismatched periods produce null.
+
+Use `--as-of YYYY-MM-DD` to exclude later filings. Facts retain start/end dates,
+filing dates and accessions; the latest eligible filing wins per period. Quarterly
+cash flows can be derived from same-start YTD disclosures, with components retained.
+Derived periods can combine filing vintages; inspect them when restatements matter.
+
+Breaking changes: YoY fields now contain fractional changes (0.20 = 20%), raw_series
+contains dated objects, and `cfo_to_net_income_ttm` replaces the overlapping-period
+cash-conversion metric. USD US-GAAP facts only; custom/IFRS tags are not mapped.
+
+## Regression tests
+
+Run offline with Python 3.10 or newer (standard library only):
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Tests use synthetic fixtures and mocked APIs; they do not certify live endpoint
+availability or current regulatory facts. GitHub Actions runs the same tests on PRs.
