@@ -12,7 +12,7 @@ Models: specialty-pharma | medtech | tools-dx | provider | payor | generic
 
 Ratios are screening prompts, not verdicts. Nothing here establishes fraud.
 """
-import argparse, collections, json, sys
+import argparse, datetime, json, math, sys
 
 TAGS = {
     "revenue": ["RevenueFromContractWithCustomerExcludingAssessedTax",
@@ -65,39 +65,178 @@ MODEL_NOTES = {
 }
 
 
-def series(facts, keys, unit_pref=("USD",)):
-    out = {}
-    usgaap = facts.get("facts", {}).get("us-gaap", {})
-    for k in keys:
-        node = usgaap.get(k)
-        if not node:
-            continue
-        for unit, rows in node.get("units", {}).items():
-            if unit_pref and unit not in unit_pref:
+INSTANTS = {"receivables", "inventory", "deferred_revenue", "goodwill",
+            "capitalised_software", "assets"}
+
+
+def days(start, end):
+    return (datetime.date.fromisoformat(end) -
+            datetime.date.fromisoformat(start)).days + 1
+
+
+def series(facts, keys, instant=False, as_of=None):
+    """Select one tag, retaining actual periods and the latest eligible filing.
+
+    A comparative period's fy/fp describes its filing, not necessarily the
+    observation. Never use those fields as the period key.
+    """
+    gaap = facts.get("facts", {}).get("us-gaap", {})
+    for tag in keys:
+        selected = {}
+        for row in gaap.get(tag, {}).get("units", {}).get("USD", []):
+            if row.get("form") not in ("10-Q", "10-K", "10-Q/A", "10-K/A"):
                 continue
-            for r in rows:
-                if r.get("form") not in ("10-Q", "10-K"):
-                    continue
-                end = r.get("end")
-                if not end:
-                    continue
-                key = (end, r.get("fp"), r.get("fy"))
-                out.setdefault(key, r.get("val"))
-        if out:
-            break
-    return dict(sorted(out.items(), key=lambda kv: kv[0][0]))
+            if not row.get("filed") or (as_of and row["filed"] > as_of):
+                continue
+            start, end, value = row.get("start"), row.get("end"), row.get("val")
+            if not end or not isinstance(value, (int, float)) or isinstance(value, bool):
+                continue
+            if not math.isfinite(value) or bool(start) == instant:
+                continue
+            try:
+                duration = days(start, end) if start else 0
+                datetime.date.fromisoformat(end)
+            except ValueError:
+                continue
+            if start and duration <= 0:
+                continue
+            key = (start, end)
+            record = {k: row.get(k) for k in
+                      ("start", "end", "val", "filed", "accn", "form")}
+            record.update(tag=tag, duration_days=duration)
+            previous = selected.get(key)
+            rank = (row["filed"], row.get("accn", ""))
+            if previous is None or rank > (previous["filed"], previous.get("accn") or ""):
+                selected[key] = record
+            elif rank == (previous["filed"], previous.get("accn") or "") and value != previous["val"]:
+                raise ValueError("Conflicting facts for the same period and filing: " + tag)
+        if selected:
+            return sorted(selected.values(), key=lambda r: (r["end"], r["start"] or ""))
+    return []
 
 
-def latest_n(s, n=12):
-    items = list(s.items())[-n:]
-    return [(k[0], v) for k, v in items]
+def quarters(rows):
+    """Use reported quarters or derive them from nested, same-start YTD periods."""
+    result = {}
+    for row in rows:
+        if 70 <= row["duration_days"] <= 110:
+            result[(row["start"], row["end"])] = dict(row, derived=False)
+    for current in rows:
+        for previous in rows:
+            if current["start"] != previous["start"] or previous["end"] >= current["end"]:
+                continue
+            start = (datetime.date.fromisoformat(previous["end"]) +
+                     datetime.timedelta(days=1)).isoformat()
+            duration = days(start, current["end"])
+            if not 70 <= duration <= 110:
+                continue
+            key = (start, current["end"])
+            if key in result:
+                continue
+            result[key] = dict(current, start=start, duration_days=duration,
+                               val=current["val"] - previous["val"], derived=True,
+                               components=[previous, current])
+    return sorted(result.values(), key=lambda r: (r["end"], r["start"]))
+
+
+def ttm(rows):
+    """Annual observations or four contiguous quarters; never sum overlapping YTDs."""
+    result = {r["end"]: dict(r, basis="reported annual")
+              for r in rows if 350 <= r["duration_days"] <= 380}
+    qs = quarters(rows)
+    for last in qs:
+        if last["end"] in result:
+            continue
+        chain = [last]
+        while len(chain) < 4:
+            target = (datetime.date.fromisoformat(chain[0]["start"]) -
+                      datetime.timedelta(days=1)).isoformat()
+            candidates = [r for r in qs if r["end"] == target]
+            if len(candidates) != 1:
+                break
+            chain.insert(0, candidates[0])
+        if len(chain) == 4 and 350 <= days(chain[0]["start"], last["end"]) <= 380:
+            result[last["end"]] = {
+                "start": chain[0]["start"], "end": last["end"],
+                "val": sum(r["val"] for r in chain),
+                "duration_days": days(chain[0]["start"], last["end"]),
+                "basis": "four contiguous quarters", "components": chain,
+            }
+    return result
 
 
 def safe_div(a, b):
-    try:
-        return round(a / b, 3) if b else None
-    except TypeError:
+    if a is None or b is None or b <= 0:
         return None
+    return round(a / b, 4)
+
+
+def year_ago(records, end):
+    candidates = [r for r in records if 350 <= days(r["end"], end) - 1 <= 380]
+    return min(candidates, key=lambda r: abs(days(r["end"], end) - 366)) if candidates else None
+
+
+def analyse(facts, model="generic", periods=12, as_of=None):
+    data = {name: series(facts, tags, name in INSTANTS, as_of)
+            for name, tags in TAGS.items()}
+    if not any(data.values()):
+        raise ValueError("No usable dated USD facts; check input, tags, and --as-of.")
+    flows = {name: ttm(rows) for name, rows in data.items() if name not in INSTANTS}
+    revenue = flows.get("revenue", {})
+    # Fix one observation date for the entire panel. A newer balance cannot be
+    # divided by an older revenue period simply because both are 'latest'.
+    end = max((r["end"] for rows in data.values() for r in rows), default=None)
+    def balance(name):
+        return next((r["val"] for r in data[name] if r["end"] == end), None)
+    def flow(name):
+        return flows.get(name, {}).get(end)
+    def value(name):
+        row = flow(name)
+        return row["val"] if row else None
+    rev, cogs = flow("revenue"), flow("cogs")
+    rec, inv = balance("receivables"), balance("inventory")
+    panel = {
+        "dso_days_latest": safe_div(rec * rev["duration_days"], rev["val"])
+            if rec is not None and rev else None,
+        "dio_days_latest": safe_div(inv * cogs["duration_days"], cogs["val"])
+            if inv is not None and cogs else None,
+        "receivables_growth_yoy": None, "revenue_growth_yoy": None,
+        "receivables_vs_revenue_gap": None,
+        "cfo_to_net_income_ttm": None,
+    }
+    prev_rec = year_ago(data["receivables"], end)
+    prev_rev = year_ago(list(revenue.values()), end)
+    if rec is not None and prev_rec and prev_rec["val"] > 0:
+        panel["receivables_growth_yoy"] = round(rec / prev_rec["val"] - 1, 4)
+    if rev and prev_rev and prev_rev["val"] > 0:
+        panel["revenue_growth_yoy"] = round(rev["val"] / prev_rev["val"] - 1, 4)
+    rg, vg = panel["receivables_growth_yoy"], panel["revenue_growth_yoy"]
+    if rg is not None and vg is not None and prev_rec["end"] == prev_rev["end"]:
+        panel["receivables_vs_revenue_gap"] = round(rg - vg, 4)
+    ni, cfo = flow("net_income"), flow("cfo")
+    if ni and cfo and ni["start"] == cfo["start"]:
+        panel["cfo_to_net_income_ttm"] = safe_div(cfo["val"], ni["val"])
+    for name in ("capitalised_software", "goodwill", "deferred_revenue"):
+        panel[name + "_latest"] = balance(name)
+    panel["rnd_latest"] = value("rnd")
+    return {
+        "schema_version": 2, "entity": facts.get("entityName"), "cik": facts.get("cik"),
+        "model": model, "as_of_filing_date": as_of, "observation_end": end,
+        "panel": panel, "raw_series": {k: v[-periods:] for k, v in data.items()},
+        "ttm_inputs": {k: v.get(end) for k, v in flows.items()},
+        "sector_overlay": MODEL_NOTES[model],
+        "limitations": [
+            "USD us-gaap facts only; first usable tag per metric. No custom-tag mapping.",
+            "Latest eligible filing wins for each actual period. Derived quarters may "
+            "combine separately filed YTD observations; inspect their components.",
+            "DSO/DIO use period-end balances and matched TTM flows, not average balances.",
+            "Missing or mismatched periods return null, never an annualized partial quarter.",
+            "YoY fields are fractional changes (0.20 means 20%), not growth multiples.",
+            "Cash conversion uses matched TTM periods and requires positive net income.",
+            "Read product revenue, reserve disclosures and independent volume evidence "
+            "before interpreting a screening ratio. No output establishes fraud.",
+        ],
+    }
 
 
 def main():
@@ -105,72 +244,20 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--facts", required=True)
     ap.add_argument("--model", default="generic", choices=list(MODEL_NOTES))
-    ap.add_argument("--periods", type=int, default=12)
+    ap.add_argument("--periods", type=int, default=12,
+                    help="number of source observations shown per metric")
+    ap.add_argument("--as-of", help="include only filings available on YYYY-MM-DD")
     a = ap.parse_args()
-
-    with open(a.facts, encoding="utf-8") as f:
-        facts = json.load(f)
-
-    data = {name: latest_n(series(facts, tags), a.periods) for name, tags in TAGS.items()}
-
-    def val(name, i):
-        rows = data.get(name) or []
-        return rows[i][1] if len(rows) > abs(i) else None
-
-    panel = collections.OrderedDict()
-    rev, rec, inv, cogs = val("revenue", -1), val("receivables", -1), val("inventory", -1), val("cogs", -1)
-    rev_p, rec_p = val("revenue", -5), val("receivables", -5)
-
-    panel["dso_days_latest"] = safe_div(rec * 365, rev) if rec and rev else None
-    panel["dio_days_latest"] = safe_div(inv * 365, cogs) if inv and cogs else None
-    panel["receivables_growth_yoy"] = safe_div(rec, rec_p) if rec and rec_p else None
-    panel["revenue_growth_yoy"] = safe_div(rev, rev_p) if rev and rev_p else None
-    if panel["receivables_growth_yoy"] and panel["revenue_growth_yoy"]:
-        panel["receivables_vs_revenue_gap"] = round(
-            panel["receivables_growth_yoy"] - panel["revenue_growth_yoy"], 3)
-        panel["receivables_gap_read"] = (
-            "Receivables outrunning revenue by more than ~10pp for two consecutive "
-            "periods is the classic channel/collection warning. Corroborate with an "
-            "independent volume series before concluding anything."
-            if panel["receivables_vs_revenue_gap"] and panel["receivables_vs_revenue_gap"] > 0.10
-            else "No material divergence in the latest period.")
-
-    ni_series = [v for _, v in (data.get("net_income") or []) if v is not None]
-    cfo_series = [v for _, v in (data.get("cfo") or []) if v is not None]
-    if ni_series and cfo_series:
-        n = min(len(ni_series), len(cfo_series), 8)
-        ni_sum, cfo_sum = sum(ni_series[-n:]), sum(cfo_series[-n:])
-        panel["cfo_to_net_income_multi_period"] = safe_div(cfo_sum, ni_sum)
-        panel["cash_conversion_read"] = (
-            "CFO/NI persistently below 1.0 across several years is the most durable "
-            "single warning in this sector. Above 1.0 with heavy D&A is normal.")
-
-    panel["capitalised_software_latest"] = val("capitalised_software", -1)
-    panel["rnd_latest"] = val("rnd", -1)
-    panel["goodwill_latest"] = val("goodwill", -1)
-    panel["deferred_revenue_latest"] = val("deferred_revenue", -1)
-
-    out = {
-        "entity": facts.get("entityName"),
-        "cik": facts.get("cik"),
-        "model": a.model,
-        "panel": panel,
-        "raw_series": data,
-        "sector_overlay": MODEL_NOTES[a.model],
-        "mandatory_next_steps": [
-            "Read the words: full-text search for change in accounting estimate, "
-            "restatement, material weakness, going concern, auditor change, and any "
-            "reworded revenue-recognition policy note.",
-            "List every non-GAAP add-back for eight quarters; flag any recurring in 5+.",
-            "Rank findings as cash / trajectory / presentation. Do not present a "
-            "presentation issue with the rhetoric of a cash issue.",
-            "Corroborate externally against an independent volume series, or stand down.",
-            "Write the specific disclosure that would clear each flag, with its date.",
-        ],
-        "disclaimer": "Screening prompts only. Nothing here establishes fraud, and no "
-                      "output of this script should assert it.",
-    }
-    json.dump(out, sys.stdout, indent=2)
+    try:
+        if a.periods < 1:
+            raise ValueError("--periods must be positive")
+        if a.as_of:
+            datetime.date.fromisoformat(a.as_of)
+        with open(a.facts, encoding="utf-8") as f:
+            result = analyse(json.load(f), a.model, a.periods, a.as_of)
+    except (ValueError, KeyError, TypeError) as exc:
+        ap.exit(2, "Invalid or insufficient facts: " + str(exc) + "\n")
+    json.dump(result, sys.stdout, indent=2, allow_nan=False)
     print()
 
 
